@@ -39,7 +39,7 @@ DEFAULT_EMBODIMENT_TAG = EmbodimentTag.REAL_G1
 
 
 # ==============================================================================
-# [USER CONFIG 2] Real Robot HW Dummy Interface (사용자 로봇 hardware SDK 바인딩)
+# [USER CONFIG 2] Real Robot HW Interface (사용자 로봇 hardware SDK 바인딩)
 # ==============================================================================
 class CustomDualArmRobot:
     """
@@ -52,46 +52,66 @@ class CustomDualArmRobot:
         # TODO: Initialize camera drivers (e.g., OpenCV, RealSense SDK)
         # TODO: Initialize robot arm joints & grippers SDK
 
-    def capture_cameras(self) -> Dict[str, np.ndarray]:
+    def capture_cameras(self, video_keys: list[str]) -> Dict[str, np.ndarray]:
         """
-        [USER CONFIG 2-A] Capture live camera frames.
+        [USER CONFIG 2-A] Capture live camera frames for requested video keys.
         Must return RGB uint8 numpy arrays with shape (H, W, 3) and values in [0, 255].
         """
-        # Example dummy camera frame 224x224 RGB
-        dummy_ego_cam = np.random.randint(0, 256, (224, 224, 3), dtype=np.uint8)
+        cameras = {}
+        for key in video_keys:
+            # Parse resolution hint if embedded in key name (e.g., "res320x240"), else default 224x224
+            if "320x240" in key:
+                h, w = 240, 320
+            else:
+                h, w = 224, 224
+            
+            # Generate dummy random RGB image frame (H, W, 3)
+            cameras[key] = np.random.randint(0, 256, (h, w, 3), dtype=np.uint8)
         
-        # Match camera keys based on selected EmbodimentTag:
-        #  - For REAL_G1: "ego_view"
-        #  - For REAL_R1_PRO_SHARPA / DROID: "exterior_image_1_left", "wrist_image_left"
-        return {
-            "ego_view": dummy_ego_cam,
-        }
+        return cameras
 
-    def get_joint_states(self) -> Dict[str, np.ndarray]:
+    def get_joint_states(self, state_keys: list[str], state_dims: Dict[str, int] = None) -> Dict[str, np.ndarray]:
         """
-        [USER CONFIG 2-B] Read current joint positions / states.
+        [USER CONFIG 2-B] Read current joint positions / EEF states for requested state keys.
         Must return float32 numpy arrays with shape (D,).
         """
-        # Example joint positions for Unitree G1 dual-arm structure:
-        # Left arm (7 joints), Right arm (7 joints), Left hand (7 joints), Right hand (7 joints), Waist (3 joints)
-        return {
-            "left_leg": np.zeros(6, dtype=np.float32),
-            "right_leg": np.zeros(6, dtype=np.float32),
-            "waist": np.zeros(3, dtype=np.float32),
-            "left_arm": np.zeros(7, dtype=np.float32),
-            "right_arm": np.zeros(7, dtype=np.float32),
-            "left_hand": np.zeros(7, dtype=np.float32),
-            "right_hand": np.zeros(7, dtype=np.float32),
-        }
+        states = {}
+        state_dims = state_dims or {}
+        for key in state_keys:
+            # Determine dimension D for key
+            if key in state_dims:
+                dim = state_dims[key]
+            elif "wrist_eef" in key:
+                dim = 9
+            elif "hand_joints" in key:
+                dim = 22  # Real R1 Pro Sharpa 22-DoF hand joints
+            elif "arm" in key or "hand" in key:
+                dim = 7
+            elif "leg" in key:
+                dim = 6
+            elif "waist" in key:
+                dim = 3
+            else:
+                dim = 7
+
+            if "wrist_eef" in key:
+                # 9D pose: [x, y, z, rot6d_r11, rot6d_r21, rot6d_r31, rot6d_r12, rot6d_r22, rot6d_r32]
+                # Set identity rot6d matrix so SVD Gram-Schmidt orthogonalization doesn't fail
+                st = np.zeros(dim, dtype=np.float32)
+                st[3] = 1.0  # r11 = 1.0
+                st[7] = 1.0  # r22 = 1.0
+                states[key] = st
+            else:
+                states[key] = np.zeros(dim, dtype=np.float32)
+
+        return states
 
     def execute_action(self, action_step: Dict[str, np.ndarray]):
         """
         [USER CONFIG 2-C] Send target joint commands to dual-arm hardware.
         """
-        # Extract actions for left & right arms
-        # left_arm_cmd = action_step["left_arm"]
-        # right_arm_cmd = action_step["right_arm"]
-        # print(f"[Robot Execute] Left arm target: {left_arm_cmd[:3]}... Right arm target: {right_arm_cmd[:3]}...")
+        # Extract actions for left & right arms / EEF
+        # e.g., left_arm_cmd = action_step.get("left_arm") or action_step.get("left_wrist_eef")
         pass
 
 
@@ -101,7 +121,7 @@ class CustomDualArmRobot:
 def main():
     parser = argparse.ArgumentParser(description="GR00T N1.7 Zero-Shot Dual-Arm Policy Inference")
     parser.add_argument("--model-path", type=str, default=DEFAULT_MODEL_PATH, help="Path to base model or HuggingFace ID")
-    parser.add_argument("--embodiment-tag", type=str, default="REAL_G1", help="Pretrain embodiment tag (e.g. REAL_G1, XDOF)")
+    parser.add_argument("--embodiment-tag", type=str, default="REAL_R1_PRO_SHARPA", help="Pretrain embodiment tag (e.g. REAL_G1, REAL_R1_PRO_SHARPA, XDOF)")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="Inference device")
     parser.add_argument("--execution-horizon", type=int, default=16, help="Number of action steps to execute per inference cycle (<= 40)")
     parser.add_argument("--task-instruction", type=str, default="Pick up the red mug with left arm and place it on the right table", help="Natural language instruction for the robot")
@@ -126,9 +146,34 @@ def main():
     # 3. Inspect Expected Modality Configs
     modality_configs = policy.get_modality_config()
     print("\n=== Expected Observation Modality Config ===")
-    print("Video Keys:", modality_configs["video"].modality_keys)
-    print("State Keys:", modality_configs["state"].modality_keys)
-    print("Action Keys:", modality_configs["action"].modality_keys)
+    print("Video Keys                      :", modality_configs["video"].modality_keys)
+    print("Video Delta Indices (Horizon T) :", modality_configs["video"].delta_indices)
+    print("State Keys                      :", modality_configs["state"].modality_keys)
+    print("State Delta Indices (Horizon T) :", modality_configs["state"].delta_indices)
+    print("Action Keys                     :", modality_configs["action"].modality_keys)
+
+    # Extract required keys & temporal horizons dynamically
+    req_video_keys = modality_configs["video"].modality_keys
+    req_state_keys = modality_configs["state"].modality_keys
+    req_lang_keys = modality_configs["language"].modality_keys
+
+    v_horizon = len(modality_configs["video"].delta_indices)  # e.g., 2 for R1 Sharpa, 1 for G1
+    s_horizon = len(modality_configs["state"].delta_indices)  # e.g., 1
+    l_horizon = len(modality_configs["language"].delta_indices)  # e.g., 1
+
+    # Infer state dimensions dynamically from processor normalization statistics
+    state_dims = {}
+    try:
+        proc_stats = policy.processor.statistics[tag.value]["state"]
+        for s_key in req_state_keys:
+            if s_key in proc_stats:
+                state_dims[s_key] = proc_stats[s_key]["min"].shape[-1]
+    except Exception as e:
+        print(f"[Warning] Could not dynamically query processor state stats: {e}")
+
+    print("\n=== Inferred State Dimensions (D) ===")
+    for s_key in req_state_keys:
+        print(f" - {s_key}: D={state_dims.get(s_key, 'default')}")
 
     # 4. Instantiate Robot Interface
     robot = CustomDualArmRobot()
@@ -139,42 +184,37 @@ def main():
     task_prompt = args.task_instruction
     execution_horizon = args.execution_horizon  # e.g. execute 16 steps out of predicted 40 steps chunk
 
-    print("\n=== Starting Closed-Loop Zero-Shot Control Loop ===")
+    print(f"\n=== Starting Closed-Loop Zero-Shot Control Loop ({tag.name}) ===")
     try:
-        while True:
+        # Run single iteration test or continuous loop
+        for step_loop in range(1):  # Can be changed to `while True:` for infinite loop
             t_start = time.time()
 
             # ------------------------------------------------------------------
-            # Step A: Capture Robot Observations
+            # Step A: Capture Robot Observations dynamically based on required keys
             # ------------------------------------------------------------------
-            camera_dict = robot.capture_cameras()
-            state_dict = robot.get_joint_states()
+            camera_dict = robot.capture_cameras(req_video_keys)
+            state_dict = robot.get_joint_states(req_state_keys, state_dims=state_dims)
 
-            # Format Video Inputs: Shape (B=1, T=1, H, W, C=3), uint8
-            # Note: T depends on delta_indices in modality_config (usually 1 or 2 timesteps)
+            # Format Video Inputs dynamically: Shape (B=1, T=v_horizon, H, W, C=3), uint8
             video_input = {}
-            for v_key in modality_configs["video"].modality_keys:
-                if v_key in camera_dict:
-                    raw_img = camera_dict[v_key]  # (H, W, 3)
-                    video_input[v_key] = np.expand_dims(np.expand_dims(raw_img, axis=0), axis=0) # (1, 1, H, W, 3)
-                else:
-                    # Fallback dummy image if key missing
-                    video_input[v_key] = np.zeros((1, 1, 224, 224, 3), dtype=np.uint8)
+            for v_key in req_video_keys:
+                raw_img = camera_dict[v_key]  # Shape: (H, W, 3)
+                # Replicate/Stack image across the required temporal horizon T
+                img_sequence = np.stack([raw_img] * v_horizon, axis=0)  # Shape: (v_horizon, H, W, 3)
+                video_input[v_key] = np.expand_dims(img_sequence, axis=0) # Shape: (1, v_horizon, H, W, 3)
 
-            # Format State Inputs: Shape (B=1, T=1, D), float32
+            # Format State Inputs dynamically: Shape (B=1, T=s_horizon, D), float32
             state_input = {}
-            for s_key in modality_configs["state"].modality_keys:
-                if s_key in state_dict:
-                    raw_state = state_dict[s_key]
-                    state_input[s_key] = np.expand_dims(np.expand_dims(raw_state, axis=0), axis=0).astype(np.float32)
-                else:
-                    # Dummy zero state fallback for missing keys
-                    state_input[s_key] = np.zeros((1, 1, 1), dtype=np.float32)
+            for s_key in req_state_keys:
+                raw_state = state_dict[s_key]  # Shape: (D,)
+                # Replicate/Stack state across the required temporal horizon T
+                state_sequence = np.stack([raw_state] * s_horizon, axis=0)  # Shape: (s_horizon, D)
+                state_input[s_key] = np.expand_dims(state_sequence, axis=0).astype(np.float32)  # Shape: (1, s_horizon, D)
 
-            # Format Language Inputs: List of list of strings, shape (B=1, T=1)
-            lang_key = modality_configs["language"].modality_keys[0]
+            # Format Language Inputs dynamically: Shape (B=1, T=l_horizon)
             language_input = {
-                lang_key: [[task_prompt]]
+                req_lang_keys[0]: [[task_prompt] * l_horizon]
             }
 
             observation = {
@@ -186,6 +226,7 @@ def main():
             # ------------------------------------------------------------------
             # Step B: Model Inference (Predict Action Chunk)
             # ------------------------------------------------------------------
+            print(f"[Observation Check] Video shape: {video_input[req_video_keys[0]].shape}, State shape: {state_input[req_state_keys[0]].shape}")
             action, info = policy.get_action(observation)
             t_infer = time.time() - t_start
 
@@ -195,7 +236,7 @@ def main():
             # Each action value has shape (B=1, T_pred=40, D)
             pred_steps = list(action.values())[0].shape[1]
             steps_to_exec = min(execution_horizon, pred_steps)
-            print(f"[Inference] Inferred action chunk shape: (1, {pred_steps}, D) in {t_infer*1000:.1f} ms. Executing {steps_to_exec} steps...")
+            print(f"[Inference Success] Inferred action chunk shape: (1, {pred_steps}, D) in {t_infer*1000:.1f} ms. Executing {steps_to_exec} steps...")
 
             for step_idx in range(steps_to_exec):
                 current_action_step = {}

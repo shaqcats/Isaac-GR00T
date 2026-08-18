@@ -22,10 +22,100 @@ from pathlib import Path
 import time
 from typing import Dict, Any, Tuple
 import numpy as np
+from PIL import Image
 import torch
 
 from gr00t.policy import Gr00tPolicy
 from gr00t.data.embodiment_tags import EmbodimentTag
+
+
+def str2bool(v):
+    """Parses boolean command line arguments (e.g. true/false/1/0/yes/no)."""
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ("yes", "true", "t", "y", "1"):
+        return True
+    elif v.lower() in ("no", "false", "f", "n", "0"):
+        return False
+    else:
+        raise argparse.ArgumentTypeError("Boolean value expected (True/False).")
+
+
+def parse_save_action_json(v):
+    """Parses --save-action-json argument supporting True/False/true/false or custom file path."""
+    if v is None:
+        return True
+    if isinstance(v, bool):
+        return v
+    v_str = str(v).strip()
+    if v_str.lower() in ("yes", "true", "t", "y", "1"):
+        return True
+    elif v_str.lower() in ("no", "false", "f", "n", "0"):
+        return False
+    # If a file path string is passed directly
+    return v_str
+
+
+# ==============================================================================
+# Helper Function: Save Input Video Frames to Disk
+# ==============================================================================
+def save_video_frames_to_disk(
+    video_dict: Dict[str, np.ndarray],
+    output_dir: str,
+    step_idx: int = 0,
+    timestamp_str: str = None,
+) -> Dict[str, list[str]]:
+    """
+    Saves the camera images from video observations into image files (PNG).
+
+    Args:
+        video_dict: Dictionary mapping video key -> np.ndarray of shape (B, T, H, W, C) or (H, W, C)
+        output_dir: Directory path where images should be saved
+        step_idx: Control loop iteration or step index
+        timestamp_str: Optional timestamp string for file naming
+
+    Returns:
+        Dictionary mapping video key to list of saved image file paths.
+    """
+    out_path = Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    if timestamp_str is None:
+        timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    saved_files = {}
+    for key, val in video_dict.items():
+        # Sanitize key name for safe filename (e.g., ego_view_res320x240_freq20 -> ego_view_res320x240_freq20)
+        safe_key = key.replace("/", "_").replace(":", "_")
+        saved_files[key] = []
+
+        if isinstance(val, np.ndarray):
+            # Extract list of frames based on tensor dimensionality
+            if val.ndim == 5:
+                # Shape (B, T, H, W, C) -> take first batch
+                frames = val[0]
+            elif val.ndim == 4:
+                # Shape (T, H, W, C)
+                frames = val
+            elif val.ndim == 3:
+                # Shape (H, W, C)
+                frames = [val]
+            else:
+                continue
+
+            for t_idx, frame in enumerate(frames):
+                # Ensure uint8 type for PIL
+                if frame.dtype != np.uint8:
+                    frame = np.clip(frame, 0, 255).astype(np.uint8)
+
+                img = Image.fromarray(frame)
+                img_filename = f"{safe_key}_step{step_idx}_t{t_idx}_{timestamp_str}.png"
+                img_path = out_path / img_filename
+                img.save(img_path)
+                saved_files[key].append(str(img_path.resolve()))
+                print(f"[Frame Saved] Camera '{key}' (t={t_idx}) -> {img_path.resolve()}")
+
+    return saved_files
 
 
 # ==============================================================================
@@ -179,17 +269,31 @@ def main():
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="Inference device")
     parser.add_argument("--execution-horizon", type=int, default=16, help="Number of action steps to execute per inference cycle (<= 40)")
     parser.add_argument("--task-instruction", type=str, default="Pick up the red mug with left arm and place it on the right table", help="Natural language instruction for the robot")
-    parser.add_argument("--save-action-json", type=str, default="output_actions/predicted_actions.json", help="Path or directory to save inferred action chunk as JSON file")
+    parser.add_argument("--save-action-json", type=parse_save_action_json, nargs="?", const=True, default=False, help="Whether to save inferred action chunk as JSON file (True/False, or custom file path)")
+    parser.add_argument("--save-action-json-path", type=str, default="output_actions/predicted_actions.json", help="Target path or directory to save action JSON when --save-action-json is True")
+    parser.add_argument("--save-video-frames", type=str2bool, nargs="?", const=True, default=False, help="Whether to save input camera video frames to disk (True/False)")
+    parser.add_argument("--save-frames-dir", type=str, default="output_frames", help="Directory to save camera images when --save-video-frames is True")
     args = parser.parse_args()
 
-    # 1. Resolve Embodiment Tag
+    # 1. Resolve JSON & Video frame save settings
+    if isinstance(args.save_action_json, str):
+        save_json_enabled = True
+        json_save_path = args.save_action_json
+    elif isinstance(args.save_action_json, bool):
+        save_json_enabled = args.save_action_json
+        json_save_path = args.save_action_json_path if save_json_enabled else None
+    else:
+        save_json_enabled = False
+        json_save_path = None
+
     tag = EmbodimentTag.resolve(args.embodiment_tag)
     print(f"=== Initializing GR00T Policy ===")
-    print(f" Model Path       : {args.model_path}")
-    print(f" Embodiment       : {tag.name} (value: {tag.value})")
-    print(f" Device           : {args.device}")
-    print(f" Instruction      : '{args.task_instruction}'")
-    print(f" Save Action JSON : {args.save_action_json}")
+    print(f" Model Path         : {args.model_path}")
+    print(f" Embodiment         : {tag.name} (value: {tag.value})")
+    print(f" Device             : {args.device}")
+    print(f" Instruction        : '{args.task_instruction}'")
+    print(f" Save Action JSON   : {save_json_enabled}" + (f" (Path: {json_save_path})" if save_json_enabled else ""))
+    print(f" Save Video Frames  : {args.save_video_frames} (Dir: {args.save_frames_dir})")
 
     # 2. Instantiate Policy
     policy = Gr00tPolicy(
@@ -279,6 +383,15 @@ def main():
                 "language": language_input,
             }
 
+            # Optional: Save Input Video Frames to disk if enabled
+            saved_frames_info = {}
+            if args.save_video_frames:
+                saved_frames_info = save_video_frames_to_disk(
+                    video_dict=video_input,
+                    output_dir=args.save_frames_dir,
+                    step_idx=step_loop,
+                )
+
             # ------------------------------------------------------------------
             # Step B: Model Inference (Predict Action Chunk)
             # ------------------------------------------------------------------
@@ -294,7 +407,7 @@ def main():
             print(f"[Inference Success] Inferred action chunk shape: (1, {pred_steps}, D) in {t_infer*1000:.1f} ms. Executing {steps_to_exec} steps...")
 
             # Save Action Chunk to JSON if requested
-            if args.save_action_json:
+            if save_json_enabled and json_save_path:
                 action_shapes = {k: list(v.shape) for k, v in action.items()}
                 metadata = {
                     "timestamp": datetime.datetime.now().isoformat(),
@@ -307,7 +420,9 @@ def main():
                     "execution_horizon": steps_to_exec,
                     "action_shapes": action_shapes,
                 }
-                save_action_chunk_to_json(action, args.save_action_json, metadata)
+                if saved_frames_info:
+                    metadata["saved_video_frames"] = saved_frames_info
+                save_action_chunk_to_json(action, json_save_path, metadata)
 
             for step_idx in range(steps_to_exec):
                 current_action_step = {}

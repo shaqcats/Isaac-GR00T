@@ -16,6 +16,9 @@ Usage:
 """
 
 import argparse
+import datetime
+import json
+from pathlib import Path
 import time
 from typing import Dict, Any, Tuple
 import numpy as np
@@ -23,6 +26,57 @@ import torch
 
 from gr00t.policy import Gr00tPolicy
 from gr00t.data.embodiment_tags import EmbodimentTag
+
+
+# ==============================================================================
+# Helper Function: Save Action Chunk to JSON
+# ==============================================================================
+def save_action_chunk_to_json(
+    action_dict: Dict[str, np.ndarray],
+    output_path: str,
+    metadata: Dict[str, Any],
+) -> Path:
+    """
+    Saves the predicted action chunk dictionary and metadata into a formatted JSON file.
+
+    Args:
+        action_dict: Dictionary mapping action key -> np.ndarray of shape (B, T, D)
+        output_path: Target JSON file path or output directory
+        metadata: Additional metadata (model path, instruction, timings, etc.)
+
+    Returns:
+        Path object of the saved JSON file.
+    """
+    path = Path(output_path)
+    if path.is_dir() or output_path.endswith("/") or output_path.endswith("\\"):
+        path.mkdir(parents=True, exist_ok=True)
+        timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = path / f"action_chunk_{timestamp_str}.json"
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Convert NumPy arrays to nested Python lists for JSON serialization
+    formatted_actions = {}
+    for key, val in action_dict.items():
+        if isinstance(val, np.ndarray):
+            # For batch size B=1, save as (T, D) for clean readability
+            if val.ndim == 3 and val.shape[0] == 1:
+                formatted_actions[key] = val[0].tolist()
+            else:
+                formatted_actions[key] = val.tolist()
+        else:
+            formatted_actions[key] = val
+
+    data_to_save = {
+        "metadata": metadata,
+        "action_chunk": formatted_actions,
+    }
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data_to_save, f, indent=2, ensure_ascii=False)
+
+    print(f"[JSON Saved] Predicted action chunk successfully saved to: {path.resolve()}")
+    return path
 
 
 # ==============================================================================
@@ -125,15 +179,17 @@ def main():
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="Inference device")
     parser.add_argument("--execution-horizon", type=int, default=16, help="Number of action steps to execute per inference cycle (<= 40)")
     parser.add_argument("--task-instruction", type=str, default="Pick up the red mug with left arm and place it on the right table", help="Natural language instruction for the robot")
+    parser.add_argument("--save-action-json", type=str, default="output_actions/predicted_actions.json", help="Path or directory to save inferred action chunk as JSON file")
     args = parser.parse_args()
 
     # 1. Resolve Embodiment Tag
     tag = EmbodimentTag.resolve(args.embodiment_tag)
     print(f"=== Initializing GR00T Policy ===")
-    print(f" Model Path    : {args.model_path}")
-    print(f" Embodiment    : {tag.name} (value: {tag.value})")
-    print(f" Device        : {args.device}")
-    print(f" Instruction   : '{args.task_instruction}'")
+    print(f" Model Path       : {args.model_path}")
+    print(f" Embodiment       : {tag.name} (value: {tag.value})")
+    print(f" Device           : {args.device}")
+    print(f" Instruction      : '{args.task_instruction}'")
+    print(f" Save Action JSON : {args.save_action_json}")
 
     # 2. Instantiate Policy
     policy = Gr00tPolicy(
@@ -231,12 +287,27 @@ def main():
             t_infer = time.time() - t_start
 
             # ------------------------------------------------------------------
-            # Step C: Action Execution (Receding Horizon Execution)
+            # Step C: Action Execution & Optional JSON Export
             # ------------------------------------------------------------------
-            # Each action value has shape (B=1, T_pred=40, D)
             pred_steps = list(action.values())[0].shape[1]
             steps_to_exec = min(execution_horizon, pred_steps)
             print(f"[Inference Success] Inferred action chunk shape: (1, {pred_steps}, D) in {t_infer*1000:.1f} ms. Executing {steps_to_exec} steps...")
+
+            # Save Action Chunk to JSON if requested
+            if args.save_action_json:
+                action_shapes = {k: list(v.shape) for k, v in action.items()}
+                metadata = {
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "model_path": args.model_path,
+                    "embodiment_tag": tag.name,
+                    "embodiment_value": tag.value,
+                    "task_instruction": task_prompt,
+                    "inference_time_ms": round(t_infer * 1000, 2),
+                    "action_horizon": pred_steps,
+                    "execution_horizon": steps_to_exec,
+                    "action_shapes": action_shapes,
+                }
+                save_action_chunk_to_json(action, args.save_action_json, metadata)
 
             for step_idx in range(steps_to_exec):
                 current_action_step = {}
